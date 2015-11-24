@@ -1,15 +1,18 @@
-import ctypes
+
 import sys
-import socket 
-import math 
+import socket
 import struct
+import binascii
+import ctypes
+import math
 import logging
 from collections import OrderedDict
 from collections import deque
 from sys import getsizeof
-import random
+from random import *
 from functools import reduce
-import md5
+import hashlib
+from RxPsub import *
 
 class Zocket:
 	"""Zocket is the main protocol that hold all API methods for bind(), connect(), send(), recieve(), and close()."""
@@ -17,15 +20,15 @@ class Zocket:
 
 	def __init__(self):
 		# UDP socket
-		self._socket = socket.societ(socket.AF_INET, socket.SOCK_DGRAM)
+		self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		# destAddr (ip, port)
 		self.destAddr = None
 		# srcAddr (port)
 		self.srcAddr = None
 		# sequence number
-		self.seq = WrapableNum(max=Packet.MAX_SEQ_NUM)
+		self.seq = counter(max=Packet.MAX_SEQ_NUM)
 		# ack number
-		self.ack = WrapableNum(max=Packet.MAX_SEQ_NUM)
+		self.ack = counter(max=Packet.MAX_SEQ_NUM)
 		# sender or receiver
 		self.isSender = False
 		# number of times to resend a packet
@@ -34,6 +37,14 @@ class Zocket:
 		self.timeout = None
 		# current connection status
 		self.connection = Connection.NOT_ESTABLISHED
+		# sending window size in bytes
+		self.sWindow = 1
+		# receiving window size in bytes
+		self.rWindow = Packet.MAX_WINDOW_SIZE
+
+		self.acceptStrings = False
+		#random value for hash
+		self.rand = 0
 
 
 	def bind(self, srcAddr):
@@ -46,16 +57,25 @@ class Zocket:
 			self._socket.bind(srcAddr)
 		else:
 			raise myException("Missing source address")
-	
+# 	""
 	def connect(self, destAddr):
 		"""
 		initiates connection with in input destAddr(ip,port)
 		Connects using 4-way handshake.
-		1. sender sends SYN packet.
-		2. receiver receives SYN then sends hashed SYN,ACK
-		3. sender verifies it and sends hashed ACK and establishes
-		4. host receives ACK and establishes connection
+		# 1. sender sends SYN packet.
+		# 2. receiver receives SYN then sends hashed SYN,ACK
+		# 3. sender verifies it and sends hashed ACK and establishes
+		# 4. host receives ACK and establishes connection
+		1. sender sends syn
+		2. server sends syn,ack with randomvalue
+		3. sender sends ack with hash
+		4. server verifies sends ack
+
 		"""
+
+		if self.srcAddr is None:
+			raise myException("Socket not bound")
+
 
 		# set destAddr
 		self.destAddr = destAddr
@@ -64,21 +84,72 @@ class Zocket:
 		self.seq.reset(0)
 
 		# send SYN and and verify SYN,ACK upon receiving 
-		synAck = self._sendSYN()
+		synAck = self._sendSYN(firstSYN=True)
 
 		# set ACK
 		ack = synAck.header.fields["seq"]
 		self.ack.reset(ack + 1)
 
 		# send hashed ACK
-		self._sendACK()
+		self._sendACK(firstSYN=True)
 
-		# connection established
-		self.connection = Connection.IDLE
+		# if sender receives ack from server after verifying hash
+		# establish connection
+		if self._recvACK():
+			# connection established
+			self.connection = Connection.IDLE
 
-		# set to be sender
-		self.isSender = True
+			# set to be sender
+			self.isSender = True
 
+	def listen(self):
+		"""listens on the given port number for 
+		packets. Blocks until a SYN packet is received.
+		"""
+
+		if self.srcAddr is None:
+			raise myException("Socket not yet bound")
+
+		waitTime = self.retries*100
+		while waitTime:
+			#print ('listening')
+			# wait to receive SYN
+			try:
+				#print ('listen receving')
+				data, addr = self.recvfrom(self.rWindow)
+
+				#print ("recv data listen", Packet.unpickle(data), addr)
+				packet = self._packet(data, checkSeq=False)
+
+				#print ('packet: listen')
+				
+			except socket.timeout:
+				waitTime -= 1
+				continue
+			except myException as e:
+				#print ('exception thrown')
+				if(e.type == myException.INVALID_CHECKSUM):
+					continue
+			else:
+				#print ('about the check SYN')
+				if packet.checkComp(("SYN",), exclusive=True):
+					#print ('received SYN')
+					break
+				else:
+					waitTime -= 1
+
+		if not waitTime:
+			raise myException(myException.CONNECTION_TIMEOUT)
+
+		# set ACM 
+		ack = packet.header.fields["seq"]
+		self.ack.reset(ack+1)
+
+		# set dest addr
+		self.destAddr = addr
+
+		# accept() should be called directly after
+		# listen() in order to complete the handshake
 	def accept(self):
 		"""
 		The receiver side of 4-way handshake
@@ -87,26 +158,36 @@ class Zocket:
 		#set seq number
 		self.seq.reset(0)
 
+		#print ('about to send synACk')
 		# sends hashed SYNACK and receive hashed ACK
-		packet = self._sendSYNACK()
+		packet = self._sendSYNACK(firstSYN=True)
+		#print ('sent synack and received Ack')
 
+		self._sendACK()
+		self.connection = Connection.IDLE
+		self.isSender = False
+
+
+		# verified ACK + hash from _sendSYNACK and established
+		# send ACK
+		#sendACK
 		# checks ACK
-		if self._recvACK():
-			# update connection status
-			self.connection = Connection.IDLE
+		# if self._recvACK(firstSYN=True):
+		# 	# update connection status
+		# 	self.connection = Connection.IDLE
 
-			# set to receiver
-			self.isSender = False
-		else:
-			raise myException.("Wrong ACK")
+		# 	# set to receiver
+		# 	self.isSender = False
+		# else:
+		# 	raise myException("Wrong ACK")
 
-	def _sendSYN(self):
+	def _sendSYN(self,firstSYN=False):
 
 		#create SYN packet
 		comp = PacketComponents.pickle(("SYN",))
 		header = Header(srcPort=self.srcAddr[1],
 			destPort=self.destAddr[1],seq=self.seq.num,
-			recvWindow=self.recvWindow, comp=comp)
+			rWindow=self.rWindow, comp=comp)
 		packet = Packet(header)
 		self.seq.next()
 
@@ -115,408 +196,700 @@ class Zocket:
 		while numRetries:
 			# send SYN
 			self.sendto(packet,self.destAddr)
+			#print ('sending SYN')
 
 			try:
-				data, addr = self.recvfrom(self.recvWindow)
+				#print ("sendSYN is receiving")
+				data, addr = self.recvfrom(self.rWindow)
+
+				#print ("recv data", Packet.unpickle(data), addr)
 				packet = self._packet(data=data, addr=addr, checkSeq=False)
 			except socket.timeout:
 				numRetries -=1
 			except myException as e:
-				if(e.type = myException.INVALID_CHECKSUM):
+				if(e.type == myException.INVALID_CHECKSUM):
 					continue
 			else:
-				if packet.checkComp(("SYN", "ACK", "CONF"), exclusive=True) and:
-					#checkdata
-					recvConf = packet.data
-					conf = md5.new(str(self.seq.num)+str(self.ack.num)).digest()
-					if recvConf==conf:
-						break
+				if packet.checkComp(("SYN", "ACK"), exclusive=True) and firstSYN:
+					p1 = Packet.unpickle(packet.pickle(), toString=True)
+					self.rand = p1.data
+					#print (p1,'SYN ACK',self.rand)
+					# self.randValue = packet.
+				if packet.checkComp(("SYN", "ACK"), exclusive=True):
+					break
 
-		if not resendsRemaining:
-			raise RxPException(RxPException.CONNECTION_TIMEOUT)
+		if not numRetries:
+			raise myException(myException.CONNECTION_TIMEOUT)
 
 		return packet
 
 
-	def _sendSYNACK(self):
+	def _sendSYNACK(self,firstSYN=False):
 
 		# send SYN, ACK with sequence number
-		comp = PacketAttributes.pickle(("SYN","ACK","CONF"))
+		comp = PacketComponents.pickle(("SYN","ACK"))
 		header = Header(
 			srcPort=self.srcAddr[1],
 			destPort=self.destAddr[1],
 			seq=self.seq.num,
 			ack=self.ack.num,
-			recvWindow=self.recvWindow,
+			rWindow=self.rWindow,
 			comp=comp
 			)
-		# md5 hash of SYN,ACK
-		verify = md5.new(str(self.seq.num)+str(self.ack.num)).digest()
-
-
-		synack = Packet(header,verify)
+		
+		#print ('sendSYNACK',firstSYN)
+		# sends random value for first SYN recieved to verify for 4-way handshake
+		if firstSYN:
+			#print ('first synning')
+			self.rand = randint(1,99)
+			#print (header,'header and randvalue', self.rand)
+			synack = Packet(header,str(self.rand))
+			#print (synack)
+		else:
+			synack = Packet(header)
 		self.seq.next()
 
-		resendsRemaining = self.resendLimit
-		while resendsRemaining:
+		numRetries = self.retries
+		while numRetries:
 
 			# send SYNACK
 			self.sendto(synack, self.destAddr)
 
 			# wait to receive ACK. Only break out of loop
-			# when ACK is received (or resendLimit exceeded)
+			# when ACK is received (or retries exceeded)
 			try:
-				data, addr = self.recvfrom(self.recvWindow)
+				data, addr = self.recvfrom(self.rWindow)
 				packet = self._packet(data=data, addr=addr, checkSeq=False)
 			except socket.timeout:
 				logging.debug("_sendSYNACK() timeout")
-				resendsRemaining -= 1
-			except RxPException as e:
-				if(e.type == RxPException.INVALID_CHECKSUM):
+				numRetries -= 1
+			except myException as e:
+				if(e.type == myException.INVALID_CHECKSUM):
 					continue
 			else:
 				
-				if packet.checkAttrs(("SYN",), exclusive=True):
+				if packet.checkComp(("SYN",), exclusive=True):
 					# SYN was resent, resend SYNACK
-					resendsRemaining = self.resendLimit
-				elif packet.checkAttrs(("ACK",), exclusive=True):
-					break
+					numRetries = self.retries
+				elif packet.checkComp(("ACK",), exclusive=True):
+					#print ("ack recved",packet.data)
+					#print ('test1')
+					verify = str(self.rand)
+					#print (verify, 'verify num')
+					verify2 = hashlib.md5(verify.encode('utf-8')).hexdigest()
+					#print (verify2,'verify')
+					verify2 = verify2[:2]
+					#print (verify2, packet.data)
+					if isinstance(packet.data, str):
+						if verify2 == packet.data:
+							#print ('breaking')
+							break
+						else:
+							raise myException("Wrong hash ACK")
+					elif isinstance(packet.data, unicode):
+						if verify2 == packet.data.decode('utf-8'):
+							#print ('breaking')
+							break
+						else:
+							raise myException("Wrong hash ACK")
 
 
-	def _sendACK(self):
+
+	def _sendACK(self,firstSYN=False):
 		"""send ACK"""
-
-		comp = PacketAttributes.pickle(("ACK","CONF"))
+		#print ('sendACK ')
+		comp = PacketComponents.pickle(("ACK",))
 		header = Header(
 			srcPort=self.srcAddr[1],
 			destPort=self.destAddr[1],
 			ack=self.ack.num,
-			recvWindow=self.recvWindow,
+			rWindow=self.rWindow,
 			comp=comp
 			)
-		verify = md5.new(str(self.ack.num)).digest()
-		packet = Packet(header,verify)
+		if firstSYN:
+			verify = self.rand
+			verify = hashlib.md5(verify.encode('utf-8')).hexdigest()
+			#print ('verify',verify)
+			packet = Packet(header,verify)
+			#print ('ACK packet', packet)
+		else:
+			packet = Packet(header)
 		self.sendto(packet, self.destAddr)
 
 	def _recvACK(self):
 		"""recv ACK"""
-		waitsRemaining = self.resendLimit
+		waitsRemaining = self.retries
 		while waitsRemaining:
 
 			# wait to receive ACK. Only break out of loop
 			# when ACK is received (or waitsRemaining exceeded)
 			try:
-				data, addr = self.recvfrom(self.recvWindow)
+				data, addr = self.recvfrom(self.rWindow)
 				packet = self._packet(data=data, addr=addr, checkSeq=False)
 			except socket.timeout:
-				resendsRemaining -= 1
-			except RxPException as e:
-				if(e.type == RxPException.INVALID_CHECKSUM):
+				numRetries -= 1
+			except myException as e:
+				if(e.type == myException.INVALID_CHECKSUM):
 					continue
 			else:
-				if packet.checkAttrs(("ACK","CONF"), exclusive=True):
-					conf = md5.new(str(self.ack.num)).digest()
-					if conf = packet.data:
-						return True
+				if packet.checkComp(("ACK",), exclusive=True):
+					#print('recved ACK return T')
+					return True
 		return False
 		
 
+	def sendto(self, packet, addr):
+		name = "sender" if self.isSender else "receiver"
+		logging.debug(name + ": sendto: " + str(packet))
+		logging.debug("")
+		self._socket.sendto(packet.pickle(), addr)
 
-
-class Connection:
-	"""enum that describes the status 
-	of a connection
-	"""
-	NOT_ESTABLISHED = "not established"
-	IDLE = "Idle"
-	SENDING = "Sending"
-	RECEVING = "Receiving"
-
-class PacketComponents:
-	"""class for creating the bit string sets the 
-	type of the packet being sent.
-	"""
-
-	# possible components
-	_values = ["SYN", "CLOSE", "CONF","NM", "EOM",  
-		"ACK", "NOP", "SRQ", "FIN"] 
-
-	@staticmethod
-	def pickle(comp=None):
-		"""produces a single byte string with the
-		correct bit set for each pack type passed
-		in as a string.
-		"""
-		if comp is None:
-			submittedComps = ()
-		else:
-			submittedComps = list(comp)
-			
-		comp
-		compList = []
-		pos = 0
-
-		# add components to list if they match
-		# an component offered in __values
-		for item in PacketAttributes._values:
-			if item in submittedComps:
-				byte = 0b1 << pos
-				comp
-				compList.append(byte)
-			pos += 1
-
-		# generate binary from array
-		if len(submittedComps) > 0:
-			if len(comp
-				compList) > 1:
-				byteStr = reduce(lambda x,y: x | y, 
-					comp
-					compList)
-			else:
-				byteStr = comp
-				compList[0]
-		else:
-			byteStr = 0
-		
-		return byteStr
-
-	@staticmethod
-	def unpickle(byteStr):
-		"""creates an instance of PacketAttributes from
-		a pickled instance (byte string)
-		"""
-		comp = list()
-		pos = 0
-
-		# check each bit in the byte string
-		for item in PacketAttributes._values: 
-			if (byteStr >> pos & 1):
-				comp.append(item)
-			pos += 1
-
-		return tuple(comp)
-
-	def __str__(self):
-		return repr(self.comp)
-
-class Header:
-	"""Encapsulation of the header fields
-	associated with a packet. See API docs
-	for descriptions of each header field.
-	"""
-
-	# define binary types for use in header fields.
-	uint16 = ctypes.c_uint16
-	uint32 = ctypes.c_uint32
-
-	# available header fields. formatted as:
-	# fieldName, dataType, numBytes
-	FIELDS = (
-		("srcPort", uint16, 2),
-		("destPort", uint16, 2),
-		("seq", uint32, 4),
-		("ack", uint32, 4),
-		("recvWindow", uint16, 2),
-		("length", uint16, 2),
-		("checksum", uint16, 2),
-		("comp", uint32, 4)
-		)
-
-	# sum of the length of all fields (bytes)
-	LENGTH = sum(map(lambda x: x[2], FIELDS))
-
-	def __init__(self, **kwargs):
-		self.fields = {}
-		keys = kwargs.keys()
-
-		for item in Header.FIELDS:
-			fieldName = item[0]
-			fieldType = item[1]
-			if fieldName in keys:
-				field = kwargs[fieldName]
-			else:
-				field = 0
-			self.fields[fieldName] = field
-
-	def pickle(self):
-		"""converts the object to a binary string
-		that can be prepended onto a packet. pickle
-		enforces size restrictions and pads fields
-		"""
-		byteArr = bytearray()
-
-		# add fields to bytearray one field at a time
-		for item in Header.FIELDS:
-			fieldName = item[0]
-			fieldType = item[1]
-			fieldVal = self.fields[fieldName]
-			if fieldVal is not None:
-				byteArr.extend(bytearray(
-					fieldType(fieldVal)))
-
-		return byteArr
-
-	@staticmethod
-	def unpickle(byteArr):
-		"""creates an instance of Header from a byte
-		array. This must be done manually using knowledge
-		about the order and size of each field.
-		"""
-
-		# ensure the byte array is of
-		# type bytearray
-		if not isinstance(byteArr, bytearray):
-			byteArr = bytearray(byteArr)
-
-		h = Header()
-		base = 0
-		for item in Header.FIELDS:
-
-			fieldName = item[0]
-			fieldType = item[1]
-			fieldSize = item[2]
-
-			# extract field from header using
-			# base + offset addressing
-			value = byteArr[base : base + fieldSize]
-
-			# convert value from bytes to int
-			field = fieldType.from_buffer(value).value
-
-			# update base
-			base += fieldSize
-
-			# add field to header 
-			h.fields[fieldName] = field
-
-		return h
-
-	def __str__(self):
-		
-		str_ = "{ "
-		for item in Header.FIELDS:
-			fieldName = item[0]
-			if fieldName in self.fields:
-				str_ += fieldName + ': ' 
-				if fieldName == "comp":
-					str_ += repr(PacketAttributes.unpickle(
-						self.fields[fieldName]))
+	def recvfrom(self, rWindow, expectedAttrs=None):
+		while True:
+			#print ("recv loop")
+			try:
+				data, addr = self._socket.recvfrom(self.rWindow)
+				break
+			except socket.error as e:
+				if e.errno == 35:
+					continue
 				else:
-					str_ += str(self.fields[fieldName]) + ', '
-		str_ += " }"
+					raise e
 
-		return str_
+		name = "sender" if self.isSender else "receiver"
+		logging.debug(name + ": recvfrom: " + str(Packet.unpickle(data)))
+		logging.debug("")
+		return (data, addr)
 
-
-class Packet:
-	"""Represents a single packet and includes
-	header and data.
-	"""
-
-	# maximum sequence number
-	MAX_SEQ_NUM = math.pow(2, 32)
-	# max window size for sender
-	# or receiver (bytes)
-	MAX_WINDOW_SIZE = 65485
-	# Ethernet MTU (1500) - UDP header
-	DATA_LENGTH = 3 #1000
-	STRING_ENCODING = 'UTF-8'
-
-	def __init__(self, header=None, data=""):
-
-		if len(data) > Packet.DATA_LENGTH:
-			self.data = data[0:Packet.DATA_LENGTH-1]
-		else:
-			self.data = data
-		self.header = header or Header()
-		self.header.fields["length"] = len(data)
-		self.header.fields["checksum"] = self._checksum()
-
-
-	def pickle(self):
-		""" returns a byte string representation
-		using pickling"""
-
-		b = bytearray()
-		b.extend(self.header.pickle())
-
-		if isinstance(self.data, str):
-			b.extend(self.data.encode(
-				encoding=Packet.STRING_ENCODING))
-		elif (isinstance(self.data, bytearray)
-			or isinstance(self.data, bytes)):
-			b.extend(self.data)
-
-		return b
-
-	@staticmethod
-	def unpickle(byteArr, toString=False):
-		""" returns an instance of Packet
-		reconstructed from a byte string.
+	def _packet(self, data, addr=None, checkSeq=True, checkAck=False):
+		""" reconstructs a packet from data and verifies
+		checksum and address (if addr is not None).
 		"""
-		p = Packet()
+		#print ("_packet 0")
+		#print (data)
+		packet = Packet.unpickle(data, toString=self.acceptStrings)
+		#print (packet)
+		
+		# verify checksum
+		if not packet.verify():
+			raise myException(myException.INVALID_CHECKSUM)
 
-		p.header = Header.unpickle(
-			byteArr[0:Header.LENGTH])
-
-		if toString:
-			p.data = byteArr[Header.LENGTH:].decode(
-				encoding=Packet.STRING_ENCODING)
-		else:
-			p.data = byteArr[Header.LENGTH:]
-
-		return p
-
-	# http://stackoverflow.com/a/1769267
-	@staticmethod
-	def _add(a, b):
-	    c = a + b
-	    return (c & 0xffff) + (c >> 16)
-
-	# http://stackoverflow.com/a/1769267
-	def _checksum(self):
-		self.header.fields["checksum"] = 0
-		p = str(self.pickle())
-
-		s = 0
-		for i in range(0, len(p)-1, 2):
-		    w = ord(p[i]) + (ord(p[i+1]) << 8)
-		    s = Packet._add(s, w)
-		s = ~s & 0xffff
-
-		return s
-
-	def verify(self):
-		# compare packet checksum with
-		# calculated checksum
-		packetChksum = self.header.fields["checksum"]
-		calcChksum = self._checksum()
-		self.header.fields["checksum"] = packetChksum
-
-		return packetChksum == calcChksum
-
-	def checkAttrs(self, expectedAttrs, exclusive=False):
-		# verify expected attrs
-		attrs = PacketAttributes.unpickle(
-			self.header.fields["attrs"])
-
-		if (exclusive and 
-			len(attrs) != len(expectedAttrs)):
-			return False
-		else:
-			for attr in expectedAttrs:
-				if (attr is not None and 
-					attr not in attrs):
-					return False
-		return True
+		#print ("_packet 1")
+		# verify seqnum
+		if checkSeq:
 			
+			#print ("_packet 2")
+			comp = PacketComponents.unpickle(
+				packet.header.fields["comp"])
+			isSYN = packet.checkComp(("SYN",), exclusive=True)
+			isACK = packet.checkComp(("ACK",), exclusive=True)
+			
+			packetSeqNum = packet.header.fields["seq"]
+			socketAckNum = self.ack.num
+			
+			if (not isSYN and packetSeqNum and 
+				socketAckNum != packetSeqNum):
+				raise myException(
+					myException.SEQ_MISMATCH)
+			elif not isACK:
+				self.ack.next()
 
-	def __str__(self):
-		d = self.__dict__ 
-		d2 = {}
-		for key in d.keys():
-			d2[key] = str(d[key])
-		return str(d2)
+
+		# if checkAck is sent, it should be set to the
+		# expected ack num
+		if checkAck:
+
+			#print ("_packet 3")
+			comp = PacketComponents.unpickle(
+				packet.header.fields["comp"])
+			
+			packetAckNum = packet.header.fields["ack"]
+
+			ackMismatch = (int(packetAckNum) - checkAck - 1)
+
+			if packetAckNum and ackMismatch:
+				logging.debug("acknum: " + str(packetAckNum))
+				return ackMismatch
+
+		return packet
+
+	# def send(self, msg):
+	# 	"""sends a message"""
+
+	# 	if self.srcAddr is None:
+	# 		raise myException("Socket not yet bound")
+		
+	# 	# list for data fragments
+	# 	dataList = list()
+	# 	# list for packets waiting to be sent
+	# 	packetList = list()
+	# 	# list for packets that have been sent but have not been ACKed
+	# 	sentList = list()
+
+	# 	lastSeqNum = self.seq.num
+
+	# 	# break up message into chunks (dataList)
+	# 	for i in range(0, len(msg), Packet.DATA_LENGTH):
+	# 		# extract data from msg
+	# 		if i+Packet.DATA_LENGTH > len(msg):
+	# 			dataList.append(msg[i:])
+	# 		else:	
+	# 			dataList.append(msg[i:i+Packet.DATA_LENGTH])
+
+	# 	# construct list of packets (packetList)
+	# 	for data in dataList:
+			
+	# 		first = data == dataList[0]
+	# 		last = data == dataList[-1]
+	
+	# 		# set beginning and end of message
+	# 		piece = list()
+	# 		if first:
+	# 			piece.append("B")
+	# 		if last:
+	# 			piece.append("E")
+
+	# 		# create packets
+	# 		comp = PacketComponents.pickle(piece)
+	# 		header = Header(
+	# 			srcPort=self.srcAddr[1],
+	# 			destPort=self.destAddr[1],
+	# 			seq=self.seq.num,
+	# 			comp=comp
+	# 			)
+	# 		packet = Packet(header, data)
+	# 		self.seq.next()
+
+	# 		# print ('packet', packet)
+
+	# 		# add packet to head of list
+	# 		packetList.append(packet)
+
+	# 	numRetries = self.retries
+	# 	while packetList and numRetries:
+	# 		# send packets (without waiting for ack)
+	# 		# until sWindow is 0 or all packets
+	# 		# have been sent
+	# 		sWindow = self.sWindow
+	# 		while sWindow and packetList:
+	# 			# get packet from the list
+	# 			packet = packetList.pop(0)
+	# 			# print (packet)
+	# 			# print (packetList)
+	# 			# send packet
+	# 			self.sendto(packet, self.destAddr)
+	# 			lastSeqNum = packet.header.fields["seq"]
+
+	# 			# decrement send window, add to sentList
+	# 			sWindow -= 1
+	# 			sentList.append(packet)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	# 		# wait for ack
+	# 		try:
+	# 			# wait for ACK or SYNACK (resent)
+	# 			data, addr = self.recvfrom(self.rWindow)
+	# 			packet = self._packet(data, checkSeq=False, checkAck=lastSeqNum)
+
+	# 		except socket.timeout:
+
+	# 			# reset send window and resend last packet
+	# 			sWindow = 1
+	# 			numRetries -= 1
+	# 			# logging.debug("send() timeout")
+	# 			# logging.debug("resends: "  + str(numRetries))
+				
+	# 			# prepend packetList with sentList, then
+	# 			# clear sentList
+	# 			sentList.reverse()
+	# 			packetList = sentList+packetList
+	# 			sentList.clear()
+
+	# 		except myException as e:
+	# 			if(e.type == myException.INVALID_CHECKSUM):
+	# 				continue
+
+	# 		else:
+	# 			sWindow += 1
+	# 			# test is ack mismatch occured
+	# 			if isinstance(packet, int):
+	# 				# logging.debug("ACK MISMATCH:")
+	# 				# logging.debug("seqnum: " + str(lastSeqNum))
+	# 				# logging.debug(packet)
+	# 				# logging.debug(sentList)
+
+	# 				while packet < 0:
+	# 					popped = [sentList.pop()]
+	# 					packetList = popped + packetList
+	# 					packet += 1	
+
+	# 			elif packet.checkComp(("SYN","ACK"), exclusive=True):
+	# 				# resend ACK acknowledging SYNACK
+	# 				self._sendACK()
+
+	# 				numRetries = self.retries
+
+	# 				# prepend packetList with sentList, then
+	# 				# clear sentList
+	# 				sentList.reverse()
+	# 				packetList = sentList+packetList
+	# 				sentList.clear()
+
+
+	# 			elif packet.checkComp(("ACK",), exclusive=True):
+	# 				# increase sWindow back to original
+	# 				# size (no positive flow control), 
+	# 				# remove packet from sentList
+	# 				self.seq.reset(packet.header.fields["ack"])
+
+	# 				numRetries = self.retries
+	# 				# pop off packet that was just acked
+	# 				# (except for final ack)
+	# 				if sentList:
+	# 					sentList.pop(0)
+
+
+	# def recv(self):
+	# 	"""receives a message"""
+	# 	print ('receving')
+		
+	# 	if self.srcAddr is None:
+	# 		print ('src recv exceptions')
+	# 		raise myException("Socket not bound")
+
+
+	# 	if self.connetion != Connection.IDLE:
+	# 		print ('connection recv exceptions')
+	# 		raise myException("Connection status not idle")
+
+	# 	print ('passed recv exceptions')
+		
+	# 	# decode and receive message
+	# 	if(self.acceptStrings):
+	# 		message = ""
+	# 	else:
+	# 		message = bytes()
+
+	# 	waitTime = self.numRetries
+	# 	while waitTime:
+	# 		print ('recv loop')
+	# 		# get packet
+	# 		try:
+	# 			# listen for data
+	# 			data, addr = self.recvfrom(self.rWindow)
+	# 			print ('data recv', data)
+	# 		except socket.timeout:
+	# 			# if no data is sent, wait again
+	# 			waitTime -= 1
+	# 			continue
+			
+	# 		# deserialize data into packet
+	# 		try:
+	# 			# logging.debug("acknum: " + str(self.ack.num))
+	# 			packet = self._packet(data, checkSeq=False)
+	# 		except myException as e:
+	# 			# logging.debug(str(e))
+	# 			if e.type == myException.INVALID_CHECKSUM:
+	# 				continue
+	# 			if e.type != myException.SEQ_MISMATCH:
+	# 				raise e
+	# 		else:
+	# 			# multiplex on packet attributes
+	# 			# if packet.checkComp(("SRQ",)):
+
+	# 			# 	# request permission to send data
+	# 			# 	# and break out of loop
+	# 			# 	self._grantSendPermission()
+				
+	# 			# # NM, E, or middle of message
+	# 			# else:
+
+	# 			if packet.header.fields["seq"] < self.ack.num:
+	# 				# an ack was dropped and this packet
+	# 				# was resent. ignore data, but send ack
+	# 				self._sendACK()
+	# 			else:
+	# 				self.ack.next()
+	# 				message += packet.data
+	# 				# send ACK
+	# 				self._sendACK()
+
+	# 			# stop looping if E
+	# 			if packet.checkComp(("E",)):
+	# 				break
+
+	# 			if packet.checkComp(("CLOSE", )):
+	# 				self._sendACK()
+	# 				self._socket.close()
+	# 				break
+
+	# 	# if not waitTime:
+	# 	# 	raise myException(
+	# 	# 		myException.CONNECTION_TIMEOUT)
+	# 	return message
+
+	def close(self):
+		# create packets
+		comp = PacketComponents.pickle(("CLOSE",))
+		header = Header(
+			srcPort=self.srcAddr[1],
+			destPort=self.destAddr[1],
+			seq=self.seq.num,
+			comp=comp
+			)
+		packet = Packet(header)
+		self.seq.next()
+
+		waitTime = self.retries
+		while waitTime:
+			
+			self.sendto(packet, self.destAddr)
+
+			try:
+				data, addr = self.recvfrom(self.rWindow)
+				packet = self._packet(data, checkSeq=False)
+
+			except socket.timeout:
+				waitTime -= 1
+				continue
+
+			except myException as e:
+				if(e.type == myException.INVALID_CHECKSUM):
+					continue
+			else:
+				if packet.checkComp(("ACK",), exclusive=True):
+					self._socket.close()
+					break
+				else:
+					waitTime -= 1
+# ""
+	
+	def send(self, msg):
+		"""sends a message"""
+
+		if self.srcAddr is None:
+			raise myException("Socket not bound")
+		
+		# FIFO queues for data fragments, queue for packets
+		# waiting to be sent, and queue for packets that
+		# have been sent but have not been ACKed
+		dataQ = deque()
+		packetQ = deque()
+		sentQ = deque()
+		lastSeqNum = self.seq.num
+
+		# break up message into chunks (dataQ)
+		for i in range(0, len(msg), Packet.DATA_LENGTH):
+			# extract data from msg
+			if i+Packet.DATA_LENGTH > len(msg):
+				dataQ.append(msg[i:])
+			else:	
+				dataQ.append(
+					msg[i:i+Packet.DATA_LENGTH])
+
+		# construct list of packets (packetQ)
+		for data in dataQ:
+			
+			first = data == dataQ[0]
+			last = data == dataQ[-1]
+	
+			# set attributes
+			attrL = list()
+			if first:
+				attrL.append("B")
+			if last:
+				attrL.append("E")
+
+			# create packets
+			comp = PacketComponents.pickle(attrL)
+			header = Header(
+				srcPort=self.srcAddr[1],
+				destPort=self.destAddr[1],
+				seq=self.seq.num,
+				comp=comp
+				)
+			packet = Packet(header, data)
+			self.seq.next()
+
+			# add packet to head of queue
+			packetQ.append(packet)
+
+		resendsRemaining = self.retries
+		while packetQ and resendsRemaining:
+			# send packets (without waiting for ack)
+			# until sWindow is 0 or all packets
+			# have been sent
+			sWindow = self.sWindow
+			while sWindow and packetQ:
+				# grab a packet from end the list
+				packet = packetQ.popleft()
+
+				# send packet
+				self.sendto(packet, self.destAddr)
+				lastSeqNum = packet.header.fields["seq"]
+
+				# decrement send window, add 
+				# to sentQ
+				sWindow -= 1
+				sentQ.append(packet)
+				print ('message packet sent')
+			# wait for ack
+			try:
+				# wait for ACK or SYNACK (resent)
+				data, addr = self.recvfrom(self.rWindow)
+				packet = self._packet(data, checkSeq=False, checkAck=lastSeqNum)
+
+			except socket.timeout:
+
+				# reset send window and resend last packet
+				sWindow = 1
+				resendsRemaining -= 1
+				logging.debug("send() timeout")
+				logging.debug("resends: "  + str(resendsRemaining))
+				
+				# prepend packetQ with sentQ, then
+				# clear sentQ
+				sentQ.reverse()
+				packetQ.extendleft(sentQ)
+				sentQ.clear()
+
+			except myException as e:
+				if(e.type == myException.INVALID_CHECKSUM):
+					continue
+
+			else:
+				sWindow += 1
+				# test is ack mismatch occured
+				if isinstance(packet, int):
+					logging.debug("ACK MISMATCH:")
+					logging.debug("seqnum: " + str(lastSeqNum))
+					logging.debug(packet)
+					logging.debug(sentQ)
+
+					while packet < 0:
+						packetQ.appendleft(sentQ.pop())
+						packet += 1	
+
+				elif packet.checkComp(("SYN","ACK"), exclusive=True):
+					# resend ACK acknowledging SYNACK
+					self._sendACK()
+
+					resendsRemaining = self.retries
+
+					# prepend packetQ with sentQ, then
+					# clear sentQ
+					sentQ.reverse()
+					packetQ.extendleft(sentQ)
+					sentQ.clear()
+
+				elif packet.checkComp(("ACK",), exclusive=True):
+					# increase sWindow back to original
+					# size (no positive flow control), 
+					# remove packet from sentQ
+					self.seq.reset(packet.header.fields["ack"])
+
+					resendsRemaining = self.retries
+					# pop off packet that was just acked
+					# (except for final ack)
+					if sentQ:
+						sentQ.popleft()
+
+
+	def recv(self):
+		"""receives a message"""
+		
+		if self.srcAddr is None:
+			print("1")
+			raise myException("Socket not bound")
+
+		print("3")
+		if self.connection != Connection.IDLE:
+			print("2")
+			raise myException("Connection status not idle")
+		
+
+		print("4")
+		# decode and receive message
+		if(self.acceptStrings):
+			message = ""
+		else:
+			message = bytes()
+
+		waitLimit = self.retries
+		while waitLimit:
+			# get packet
+			print ('waiting')
+			try:
+				# listen for data
+				data, addr = self.recvfrom(self.rWindow)
+				print ('recv data',data)
+			except socket.timeout:
+				# if no data is sent, wait again
+				waitLimit -= 1
+				continue
+			
+			# deserialize data into packet
+			try:
+				logging.debug("acknum: " + str(self.ack.num))
+				packet = self._packet(data, checkSeq=False)
+			except myException as e:
+				logging.debug(str(e))
+				if e.type == myException.INVALID_CHECKSUM:
+					continue
+				if e.type != myException.SEQ_MISMATCH:
+					raise e
+			else:
+				# multiplex on packet attributes
+				# if packet.checkComp(("SRQ",)):
+
+				# 	# request permission to send data
+				# 	# and break out of loop
+				# 	self._grantSendPermission()
+				
+				# # NM, E, or middle of message
+				# else:
+
+				if packet.header.fields["seq"] < self.ack.num:
+					# an ack was dropped and this packet
+					# was resent. ignore data, but send ack
+					self._sendACK();
+				else:
+					self.ack.next()
+					message += packet.data
+					# send ACK
+					self._sendACK()
+
+				# stop looping if E
+				if packet.checkComp(("E",)):
+					break
+
+				if packet.checkComp(("CLOSE", )):
+					self._sendACK()
+					self._socket.close()
+					break
+
+		# if not waitLimit:
+		# 	raise myException(
+		# 		myException.CONNECTION_TIMEOUT)
+		return message
+
 
 
 
