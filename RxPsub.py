@@ -36,7 +36,7 @@ class myException(Exception):
 		self.type = type_
 		self.inner = innerException
 		if msg is None:
-			self.msg = RxPException.DEFAULT_MSG[type_]
+			self.msg = myException.DEFAULT_MSG[type_]
 		else:
 			self.msg = msg
 
