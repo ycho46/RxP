@@ -235,12 +235,12 @@ def testSocketSendRcv(clientAddr, serverAddr, netAddr, timeout=3, message="Hello
 	client = Zocket()
 	client.bind(clientAddr)
 	client.timeout = timeout
-	client.acceptStrings = True
+	client.strMsg = True
 
 	server = Zocket()
 	server.bind(serverAddr)
 	server.timeout = timeout
-	server.acceptStrings = True
+	server.strMsg = True
 
 
 	# run server
@@ -321,11 +321,11 @@ def testRequestSendPermission(clientAddr, serverAddr, netAddr, timeout=3):
 	client = Zocket()
 	client.timeout = timeout
 	client.bind(clientAddr)
-	client.acceptStrings = True
+	client.strMsg = True
 	server = Zocket()
 	server.timeout = timeout
 	server.bind(serverAddr)
-	server.acceptStrings = True
+	server.strMsg = True
 
 	def runserver(server):
 		server.listen()

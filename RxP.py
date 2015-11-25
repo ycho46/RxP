@@ -1,4 +1,3 @@
-
 import sys
 import socket
 import struct
@@ -17,8 +16,12 @@ from RxPsub import *
 class Zocket:
 	"""Zocket is the main protocol that hold all API methods for bind(), connect(), send(), recieve(), and close()."""
 
-
+	# constructor for Zocket
 	def __init__(self):
+
+		if sys.hexversion != 50594800:
+			raise myException("Please run with Python version 3.4.3")
+
 		# UDP socket
 		self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 		# destAddr (ip, port)
@@ -31,29 +34,31 @@ class Zocket:
 		self.ack = counter(max=Packet.MAX_SEQ_NUM)
 		# sender or receiver
 		self.isSender = False
-		# number of times to resend a packet
+		# number of times to retry sending a packet
 		self.retries = 50
-		# no timeout
-		self.timeout = None
-		# current connection status
+		# current connection stats
 		self.connection = Connection.NOT_ESTABLISHED
 		# sending window size in bytes
 		self.sWindow = 1
 		# receiving window size in bytes
 		self.rWindow = Packet.MAX_WINDOW_SIZE
-
-		self.acceptStrings = False
+		# boolean value for setting msgs to be bytes or strs
+		self.strMsg = False
 		#random value for hash
 		self.rand = 0
+		# no timeout
+		self.timeout = None
+
 
 	# timeout is used to interact with
 	# self._socket's timeout property
 	@property
 	def timeout(self):
-	    return self._socket.gettimeout()
+   		return self._socket.gettimeout()
 	@timeout.setter
 	def timeout(self, value):
 		self._socket.settimeout(value)
+	
 
 	def bind(self, srcAddr):
 		"""
@@ -70,20 +75,18 @@ class Zocket:
 		"""
 		initiates connection with in input destAddr(ip,port)
 		Connects using 4-way handshake.
-		# 1. sender sends SYN packet.
-		# 2. receiver receives SYN then sends hashed SYN,ACK
-		# 3. sender verifies it and sends hashed ACK and establishes
-		# 4. host receives ACK and establishes connection
-		1. sender sends syn
-		2. server sends syn,ack with randomvalue
-		3. sender sends ack with hash
-		4. server verifies sends ack
-
+		1. Sender sends SYN packet
+		2. Receiver receives SYN and sends SYN,ACK with
+			 randomvalue for authentication
+		3. Sender receives SYN,ACK with randomvalue and 
+			sends ACK packet with hashed randomvalue
+		4. Receiver verifies authenticity and establishes 
+			connection upon verification and sends ACK
+		5. Sender receives ACK and establishes connection 
 		"""
 
 		if self.srcAddr is None:
-			raise myException("Socket not bound")
-
+			raise myException("Socket is not bound")
 
 		# set destAddr
 		self.destAddr = destAddr
@@ -98,7 +101,7 @@ class Zocket:
 		ack = synAck.header.fields["seq"]
 		self.ack.reset(ack + 1)
 
-		# send hashed ACK
+		# send ACK with randomvalue
 		self._sendACK(firstSYN=True)
 
 		# if sender receives ack from server after verifying hash
@@ -111,85 +114,65 @@ class Zocket:
 			self.isSender = True
 
 	def listen(self):
-		"""listens on the given port number for 
-		packets. Blocks until a SYN packet is received.
+		"""listens on port number for SYN packets.
 		"""
 
 		if self.srcAddr is None:
 			raise myException("Socket not yet bound")
 
-		waitTime = self.retries*100
-		while waitTime:
-			print ('listening')
-			# wait to receive SYN
+		numWait = self.retries*100
+		while numWait:
+			# loop until SYN is received
 			try:
-				print ('listen receving')
 				data, addr = self.recvfrom(self.rWindow)
-
-				print ("recv data listen", Packet.unpickle(data), addr)
 				packet = self._packet(data, checkSeq=False)
-
-				print ('packet: listen')
 				
 			except socket.timeout:
-				waitTime -= 1
+				numWait -= 1
 				continue
 			except myException as e:
-				print ('exception thrown')
 				if(e.type == myException.INVALID_CHECKSUM):
 					continue
 			else:
-				print ('about the check SYN')
 				if packet.checkComp(("SYN",), exclusive=True):
-					print ('received SYN')
 					break
 				else:
-					waitTime -= 1
+					numWait -= 1
 
-		if not waitTime:
+		if not numWait:
 			raise myException(myException.CONNECTION_TIMEOUT)
 
-		# set ACM 
+		# set ACK
 		ack = packet.header.fields["seq"]
 		self.ack.reset(ack+1)
 
-		# set dest addr
+		# set destAddr
 		self.destAddr = addr
 
-		# accept() should be called directly after
-		# listen() in order to complete the handshake
 	def accept(self):
 		"""
-		The receiver side of 4-way handshake
+		The receiver side of 4-way handshake.
+		This method should be called right after listen()
 		"""
 
 		#set seq number
 		self.seq.reset(0)
 
-		print ('about to send synACk')
-		# sends hashed SYNACK and receive hashed ACK
+		# sends SYNACK with random value and
+		# receives ACK with hashed random value
 		packet = self._sendSYNACK(firstSYN=True)
-		print ('sent synack and received Ack')
 
+		# ACK with hahsed random value has been verfied
+		# so send an ACK and server establishes connection 
 		self._sendACK()
 		self.connection = Connection.IDLE
 		self.isSender = False
 
-
-		# verified ACK + hash from _sendSYNACK and established
-		# send ACK
-		#sendACK
-		# checks ACK
-		# if self._recvACK(firstSYN=True):
-		# 	# update connection status
-		# 	self.connection = Connection.IDLE
-
-		# 	# set to receiver
-		# 	self.isSender = False
-		# else:
-		# 	raise myException("Wrong ACK")
-
 	def _sendSYN(self,firstSYN=False):
+		"""
+		method for sending SYN
+		when firstSYN is True, initiates a handshake by sending SYN.
+		"""
 
 		#create SYN packet
 		comp = PacketComponents.pickle(("SYN",))
@@ -203,14 +186,12 @@ class Zocket:
 		numRetries = self.retries
 		while numRetries:
 			# send SYN
-			self.sendto(packet,self.destAddr)
-			print ('sending SYN')
+			# self.sendto(packet,self.destAddr)
 
+			self._socket.sendto(packet.pickle(), self.destAddr)
+			#loops till SYN,ACK is received or timeout
 			try:
-				print ("sendSYN is receiving")
 				data, addr = self.recvfrom(self.rWindow)
-
-				print ("recv data", Packet.unpickle(data), addr)
 				packet = self._packet(data=data, addr=addr, checkSeq=False)
 			except socket.timeout:
 				numRetries -=1
@@ -218,12 +199,11 @@ class Zocket:
 				if(e.type == myException.INVALID_CHECKSUM):
 					continue
 			else:
+
 				if packet.checkComp(("SYN", "ACK"), exclusive=True) and firstSYN:
 					p1 = Packet.unpickle(packet.pickle(), toString=True)
 					self.rand = p1.data
 					print (p1,'SYN ACK',self.rand)
-					# self.randValue = packet.
-				if packet.checkComp(("SYN", "ACK"), exclusive=True):
 					break
 
 		if not numRetries:
@@ -233,8 +213,10 @@ class Zocket:
 
 
 	def _sendSYNACK(self,firstSYN=False):
-
-		# send SYN, ACK with sequence number
+		"""
+		used by server to send SYN,ACK and the random value
+		"""
+		# create packet with SYN, ACK
 		comp = PacketComponents.pickle(("SYN","ACK"))
 		header = Header(
 			srcPort=self.srcAddr[1],
@@ -245,67 +227,56 @@ class Zocket:
 			comp=comp
 			)
 		
-		print ('sendSYNACK',firstSYN)
-		# sends random value for first SYN recieved to verify for 4-way handshake
+		# sends packet with random value for 4-way handshake
 		if firstSYN:
-			print ('first synning')
 			self.rand = randint(1,99)
-			print (header,'header and randvalue', self.rand)
 			synack = Packet(header,str(self.rand))
-			print (synack)
 		else:
 			synack = Packet(header)
 		self.seq.next()
 
+		#set number of retries to send the packet
 		numRetries = self.retries
 		while numRetries:
+			# send packet
+			# self.sendto(synack, self.destAddr)
 
-			# send SYNACK
-			self.sendto(synack, self.destAddr)
-
-			# wait to receive ACK. Only break out of loop
-			# when ACK is received (or retries exceeded)
+			self._socket.sendto(synack.pickle(), self.destAddr)
+			# loop until ACK with correct hash value is received
 			try:
 				data, addr = self.recvfrom(self.rWindow)
 				packet = self._packet(data=data, addr=addr, checkSeq=False)
 			except socket.timeout:
-				logging.debug("_sendSYNACK() timeout")
 				numRetries -= 1
 			except myException as e:
 				if(e.type == myException.INVALID_CHECKSUM):
 					continue
 			else:
-				
+				# When received packet is a SYN, resend packet
 				if packet.checkComp(("SYN",), exclusive=True):
-					# SYN was resent, resend SYNACK
 					numRetries = self.retries
+				# When ACK is received, verfiity authenticity
 				elif packet.checkComp(("ACK",), exclusive=True):
-					print ("ack recved",packet.data)
-					print ('test1')
 					verify = str(self.rand)
-					print (verify, 'verify num')
 					verify2 = hashlib.md5(verify.encode('utf-8')).hexdigest()
-					print (verify2,'verify')
 					verify2 = verify2[:2]
 					print (verify2, packet.data)
 					if isinstance(packet.data, str):
 						if verify2 == packet.data:
-							print ('breaking')
 							break
 						else:
 							raise myException("Wrong hash ACK")
 					else:
 						if verify2 == packet.data.decode('utf-8'):
-							print ('breaking')
 							break
 						else:
 							raise myException("Wrong hash ACK")
 
 
-
 	def _sendACK(self,firstSYN=False):
-		"""send ACK"""
-		print ('sendACK ')
+		"""
+		send ACK used for sending ACK with has and regular ACK
+		"""
 		comp = PacketComponents.pickle(("ACK",))
 		header = Header(
 			srcPort=self.srcAddr[1],
@@ -314,23 +285,23 @@ class Zocket:
 			rWindow=self.rWindow,
 			comp=comp
 			)
+		# when it is the first ACK after SYN,ACK
 		if firstSYN:
 			verify = self.rand
 			verify = hashlib.md5(verify.encode('utf-8')).hexdigest()
-			print ('verify',verify)
 			packet = Packet(header,verify)
-			print ('ACK packet', packet)
 		else:
 			packet = Packet(header)
-		self.sendto(packet, self.destAddr)
+		self._socket.sendto(packet.pickle(), self.destAddr)
 
 	def _recvACK(self):
-		"""recv ACK"""
+		"""
+		recvACK used sender
+		"""
+		# set number of retries to recive ACK before timeout
 		numRetries = self.retries
 		while numRetries:
-
-			# wait to receive ACK. Only break out of loop
-			# when ACK is received (or waitsRemaining exceeded)
+			# loop until ACK value is received
 			try:
 				data, addr = self.recvfrom(self.rWindow)
 				packet = self._packet(data=data, addr=addr, checkSeq=False)
@@ -340,21 +311,23 @@ class Zocket:
 				if(e.type == myException.INVALID_CHECKSUM):
 					continue
 			else:
+				#When ACK received return True
 				if packet.checkComp(("ACK",), exclusive=True):
-					print('recved ACK return T')
 					return True
 		return False
 		
 
-	def sendto(self, packet, addr):
-		name = "sender" if self.isSender else "receiver"
-		logging.debug(name + ": sendto: " + str(packet))
-		logging.debug("")
-		self._socket.sendto(packet.pickle(), addr)
+	# def sendto(self, packet, addr):
+	# 	"""
+	# 	send packet addr
+	# 	"""
+	# 	name = "sender" if self.isSender else "receiver"
+	# 	logging.debug(name + ": sendto: " + str(packet))
+	# 	logging.debug("")
+	# 	self._socket.sendto(packet.pickle(), addr)
 
 	def recvfrom(self, rWindow, expectedAttrs=None):
 		while True:
-			print ("recv loop")
 			try:
 				data, addr = self._socket.recvfrom(self.rWindow)
 				break
@@ -363,58 +336,37 @@ class Zocket:
 					continue
 				else:
 					raise e
-
-		name = "sender" if self.isSender else "receiver"
-		logging.debug(name + ": recvfrom: " + str(Packet.unpickle(data)))
-		logging.debug("")
 		return (data, addr)
 
 	def _packet(self, data, addr=None, checkSeq=True, checkAck=False):
-		""" reconstructs a packet from data and verifies
-		checksum and address (if addr is not None).
+		""" 
+		assembles packet from data verify checksum and addr
 		"""
-		print ("_packet 0")
-		print (data)
-		packet = Packet.unpickle(data, toString=self.acceptStrings)
-		print (packet)
-		
-		# verify checksum
+		packet = Packet.unpickle(data, toString=self.strMsg)
+		# verify the checksum
 		if not packet.verify():
 			raise myException(myException.INVALID_CHECKSUM)
-
-		print ("_packet 1")
-		# verify seqnum
+		# verify sequence num
 		if checkSeq:
-			
-			print ("_packet 2")
 			comp = PacketComponents.unpickle(
 				packet.header.fields["comp"])
 			isSYN = packet.checkComp(("SYN",), exclusive=True)
 			isACK = packet.checkComp(("ACK",), exclusive=True)
-			
 			packetSeqNum = packet.header.fields["seq"]
 			socketAckNum = self.ack.num
 			
-			if (not isSYN and packetSeqNum and 
-				socketAckNum != packetSeqNum):
-				raise myException(
-					myException.SEQ_MISMATCH)
+			if (not isSYN and packetSeqNum and socketAckNum != packetSeqNum):
+				raise myException(myException.SEQ_MISMATCH)
 			elif not isACK:
 				self.ack.next()
 
 
-		# if checkAck is sent, it should be set to the
-		# expected ack num
+		# if checkAck is sent, set ack to expected ACK
 		if checkAck:
-
-			print ("_packet 3")
 			comp = PacketComponents.unpickle(
 				packet.header.fields["comp"])
-			
 			packetAckNum = packet.header.fields["ack"]
-
 			ackMismatch = (int(packetAckNum) - checkAck - 1)
-
 			if packetAckNum and ackMismatch:
 				logging.debug("acknum: " + str(packetAckNum))
 				return ackMismatch
@@ -423,30 +375,26 @@ class Zocket:
 
 
 	def close(self):
-		# create packets
+		# assemble packets
 		comp = PacketComponents.pickle(("CLOSE",))
 		header = Header(
-			srcPort=self.srcAddr[1],
-			destPort=self.destAddr[1],
-			seq=self.seq.num,
-			comp=comp
+			srcPort=self.srcAddr[1], destPort=self.destAddr[1],
+			seq=self.seq.num, comp=comp
 			)
 		packet = Packet(header)
 		self.seq.next()
-
-		waitTime = self.retries
-		while waitTime:
-			
-			self.sendto(packet, self.destAddr)
-
+		#set number of waits before close
+		numWait = self.retries
+		while numWait:
+			#send close packet
+			self._socket.sendto(packet.pickle(), self.destAddr)
+			#loop until ACK is received
 			try:
 				data, addr = self.recvfrom(self.rWindow)
 				packet = self._packet(data, checkSeq=False)
-
 			except socket.timeout:
-				waitTime -= 1
+				numWait -= 1
 				continue
-
 			except myException as e:
 				if(e.type == myException.INVALID_CHECKSUM):
 					continue
@@ -455,14 +403,14 @@ class Zocket:
 					self._socket.close()
 					break
 				else:
-					waitTime -= 1
-# ""
+					numWait -= 1
 	
 	def send(self, msg):
-		"""sends a message"""
-
+		"""
+		method for sending message
+		"""
 		if self.srcAddr is None:
-			raise myException("Socket not bound")
+			raise myException("Socket is bound to port")
 		
 		# FIFO queues for data fragments, queue for packets
 		# waiting to be sent, and queue for packets that
@@ -519,7 +467,7 @@ class Zocket:
 				packet = packetQ.popleft()
 
 				# send packet
-				self.sendto(packet, self.destAddr)
+				self._socket.sendto(packet.pickle(), self.destAddr)
 				lastSeqNum = packet.header.fields["seq"]
 
 				# decrement send window, add 
@@ -593,18 +541,13 @@ class Zocket:
 		"""receives a message"""
 		
 		if self.srcAddr is None:
-			#print("1")
 			raise myException("Socket not bound")
 
-		#print("3")
 		if self.connection != Connection.IDLE:
-			#print("2")
 			raise myException("Connection status not idle")
 		
-
-		#print("4")
 		# decode and receive message
-		if(self.acceptStrings):
+		if(self.strMsg):
 			message = ""
 		else:
 			message = bytes()
